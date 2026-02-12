@@ -1,266 +1,552 @@
 /**
- * App.tsx — Fleet Tracker Mobile App
- * Entry point. Handles permission flow, shows tracking status,
- * and displays last known location.
+ * App.tsx — Fleet Tracker
+ * Screen 1 (Setup): Driver picks their name from a list, picks a vehicle → Start Shift
+ * Screen 2 (Tracking): Live GPS stats, End Shift button
+ * Session survives app restarts via AsyncStorage.
  */
 
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
-  Alert,
-  AppState,
-  SafeAreaView,
-  
-  StyleSheet,
-  Text,
-  TouchableOpacity,
-  View,
-  Platform,
-  ActivityIndicator,
+  ActivityIndicator, Alert, FlatList, Platform,
+  SafeAreaView, StyleSheet, Text,
+  TouchableOpacity, View,
 } from 'react-native';
-import * as Device from 'expo-device';
-import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as Location from 'expo-location';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import LocationService from './services/LocationService';
 
-// ─── Constants ─────────────────────────────────────────────────────────────────
-const DRIVER_ID_KEY = 'fleet_driver_id';
+// ─── Set this to your backend LAN IP ──────────────────────────────────────────
+const API = 'https://658e-105-165-217-230.ngrok-free.app';  // ← change to your server's IP
+// ──────────────────────────────────────────────────────────────────────────────
+
+const SESSION_KEY = 'fleet_active_session';
+
+interface Driver  { _id: string; name: string; employeeId?: string; onShift: boolean; }
+interface Vehicle {
+  isActive: boolean; _id: string; name: string; plateNumber?: string; type: string; inUse: boolean; currentDriverName?: string; 
+}
+
+type Screen = 'loading' | 'setup' | 'tracking';
+type Step   = 'driver' | 'vehicle';   // two-step setup wizard
 
 export default function App() {
-  const [status, setStatus] = useState<'idle' | 'requesting' | 'tracking' | 'error'>('idle');
-  const [lastLocation, setLastLocation] = useState<Location.LocationObject | null>(null);
-  const [queueCount, setQueueCount] = useState(0);
-  const [errorMsg, setErrorMsg] = useState('');
-  const appState = useRef(AppState.currentState);
+  const [screen, setScreen]                 = useState<Screen>('loading');
+  const [step, setStep]                     = useState<Step>('driver');
 
-  // ── On Mount ──────────────────────────────────────────────────────────────
+  const [drivers, setDrivers]               = useState<Driver[]>([]);
+  const [vehicles, setVehicles]             = useState<Vehicle[]>([]);
+  const [loadingDrivers, setLoadingDrivers] = useState(false);
+  const [loadingVehicles, setLoadingVehicles] = useState(false);
 
-  useEffect(() => {
-    bootstrapApp();
+  const [selectedDriver, setSelectedDriver]   = useState<Driver | null>(null);
+  const [selectedVehicle, setSelectedVehicle] = useState<Vehicle | null>(null);
+  const [startingShift, setStartingShift]     = useState(false);
 
-    // Watch app state changes (background → foreground) to refresh queue count
-    const subscription = AppState.addEventListener('change', nextState => {
-      if (appState.current.match(/inactive|background/) && nextState === 'active') {
-        refreshQueueCount();
+  const [lastLocation, setLastLocation]       = useState<Location.LocationObject | null>(null);
+  const [activeSession, setActiveSession]     = useState<{
+    driver: Driver; vehicle: Vehicle; startedAt: string;
+  } | null>(null);
+
+  // ── Boot ───────────────────────────────────────────────────────────────────
+  useEffect(() => { boot(); }, []);
+
+  async function boot() {
+    try {
+      const raw = await AsyncStorage.getItem(SESSION_KEY);
+      if (raw) {
+        const session = JSON.parse(raw);
+        setActiveSession(session);
+        await LocationService.init(API, session.vehicle._id, session.driver._id);
+        await LocationService.startTracking(loc => setLastLocation(loc));
+        setScreen('tracking');
+      } else {
+        setScreen('setup');
+        fetchDrivers();
       }
-      appState.current = nextState;
-    });
+    } catch {
+      setScreen('setup');
+      fetchDrivers();
+    }
+  }
 
-    return () => subscription.remove();
+  // ── Data fetching ──────────────────────────────────────────────────────────
+  async function fetchDrivers() {
+    setLoadingDrivers(true);
+    try {
+      const res = await fetch(`${API}/api/drivers`);
+      if (!res.ok) throw new Error('Server error');
+      setDrivers(await res.json());
+    } catch (err: any) {
+      Alert.alert('Cannot reach server', `Check the API address in App.tsx.\n\nAPI: ${API}\nError: ${err.message}`);
+    } finally {
+      setLoadingDrivers(false);
+    }
+  }
+
+  async function fetchVehicles() {
+    setLoadingVehicles(true);
+    try {
+      const res = await fetch(`${API}/api/vehicles`);
+      if (!res.ok) throw new Error('Server error');
+      const all: Vehicle[] = await res.json();
+      setVehicles(all);
+    } catch (err: any) {
+      Alert.alert('Cannot reach server', err.message);
+    } finally {
+      setLoadingVehicles(false);
+    }
+  }
+
+  // ── Start shift ────────────────────────────────────────────────────────────
+  async function startShift() {
+    if (!selectedDriver || !selectedVehicle) return;
+    setStartingShift(true);
+    console.log(selectedDriver, selectedVehicle)
+    try {
+      // Mark vehicle in-use on backend
+      const res = await fetch(`${API}/api/vehicles/${selectedVehicle._id}/startShift`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ startShift: true, driverId: selectedDriver._id }),
+      });
+      if (!res.ok) throw new Error(await res.text());
+
+      await LocationService.init(API, selectedVehicle._id, selectedDriver._id);
+      await LocationService.startTracking(loc => setLastLocation(loc));
+
+      const session = {
+        driver:     selectedDriver,
+        vehicle:    selectedVehicle,
+        startedAt:  new Date().toISOString(),
+      };
+      await AsyncStorage.setItem(SESSION_KEY, JSON.stringify(session));
+      setActiveSession(session);
+      setScreen('tracking');
+    } catch (err: any) {
+      Alert.alert('Failed to start shift', err.message);
+    } finally {
+      setStartingShift(false);
+    }
+  }
+
+  // ── End shift ──────────────────────────────────────────────────────────────
+  function confirmEndShift() {
+    Alert.alert('End Shift', 'Are you sure you want to end your shift?', [
+      { text: 'Cancel', style: 'cancel' },
+      { text: 'End Shift', style: 'destructive', onPress: doEndShift },
+    ]);
+  }
+
+  
+async function doEndShift() {
+  Alert.alert(
+    'End Shift',
+    'Are you sure you want to end your shift?',
+    [
+      {
+        text: 'Cancel',
+        style: 'cancel',
+      },
+      {
+        text: 'End Shift',
+        style: 'destructive',
+        onPress: async () => {
+          try {
+            await LocationService.stopTracking();
+
+            if (activeSession) {
+              await fetch(
+                `${API}/api/vehicles/${activeSession.vehicle._id}/endShift`,
+                {
+                  method: 'PUT',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({
+                    endShift: true,
+                    driverId: activeSession.driver._id,
+                  }),
+                }
+              );
+            }
+
+            await AsyncStorage.removeItem(SESSION_KEY);
+
+            setActiveSession(null);
+            setLastLocation(null);
+            setSelectedDriver(null);
+            setSelectedVehicle(null);
+            setStep('driver');
+            setScreen('setup');
+
+            fetchDrivers();
+            fetchVehicles();
+          } catch (err) {
+            console.error('Failed to end shift', err);
+            Alert.alert(
+              'Error',
+              'Failed to end shift. Please try again.'
+            );
+          }
+        },
+      },
+    ],
+    { cancelable: true }
+  );
+}
+
+
+  // ── Render ─────────────────────────────────────────────────────────────────
+  if (screen === 'loading') {
+    return (
+      <SafeAreaView style={s.container}>
+        <ActivityIndicator size="large" color={C.blue} />
+        <Text style={s.loadingText}>Loading…</Text>
+      </SafeAreaView>
+    );
+  }
+
+  if (screen === 'tracking' && activeSession) {
+    return (
+      <TrackingScreen
+        session={activeSession}
+        lastLocation={lastLocation}
+        onEndShift={doEndShift}
+      />
+    );
+  }
+
+  // ── Setup: Step 1 — Pick driver ───────────────────────────────────────────
+  if (step === 'driver') {
+    return (
+      <SafeAreaView style={s.container}>
+        <View style={s.header}>
+          <Text style={s.appName}>FleetTracker</Text>
+          <Text style={s.subtitle}>Who are you?</Text>
+        </View>
+
+        <View style={s.stepIndicator}>
+          <View style={[s.stepDot, s.stepDotActive]} /><View style={s.stepLine} />
+          <View style={s.stepDot} />
+        </View>
+
+        <View style={s.sectionHeader}>
+          <Text style={s.label}>SELECT YOUR NAME</Text>
+          <TouchableOpacity onPress={fetchDrivers}>
+            <Text style={s.refreshBtn}>↻ Refresh</Text>
+          </TouchableOpacity>
+        </View>
+
+        {loadingDrivers
+          ? <ActivityIndicator color={C.blue} style={{ marginTop: 20 }} />
+          : drivers.length === 0
+            ? <EmptyState
+                message="No drivers found"
+                sub="Ask your admin to add drivers on the dashboard."
+                onRetry={fetchDrivers}
+              />
+            : (
+              <FlatList
+                data={drivers}
+                keyExtractor={d => d._id}
+                style={{ flex: 1, marginTop: 8 }}
+                renderItem={({ item }) => {
+                  const isSelected = selectedDriver?._id === item._id;
+                  const isBusy = item.onShift;
+                  return (
+                    <TouchableOpacity
+                      style={[s.listItem, isSelected && s.listItemSelected, isBusy && s.listItemDim]}
+                      onPress={() => !isBusy && setSelectedDriver(item)}
+                      disabled={isBusy}
+                    >
+                      <Text style={s.listItemIcon}>👤</Text>
+                      <View style={{ flex: 1 }}>
+                        <Text style={[s.listItemName, isSelected && s.listItemNameSelected]}>
+                          {item.name}
+                        </Text>
+                        {item.employeeId && (
+                          <Text style={s.listItemSub}>ID: {item.employeeId}</Text>
+                        )}
+                        {isBusy && <Text style={s.listItemBusy}>Currently on shift</Text>}
+                      </View>
+                      {isSelected && <Text style={s.check}>✓</Text>}
+                    </TouchableOpacity>
+                  );
+                }}
+              />
+            )
+        }
+
+        <TouchableOpacity
+          style={[s.primaryBtn, !selectedDriver && s.primaryBtnDisabled]}
+          onPress={() => { fetchVehicles(); setStep('vehicle'); }}
+          disabled={!selectedDriver}
+        >
+          <Text style={s.primaryBtnText}>Next — Select Vehicle</Text>
+        </TouchableOpacity>
+      </SafeAreaView>
+    );
+  }
+
+  // ── Setup: Step 2 — Pick vehicle ──────────────────────────────────────────
+  return (
+    <SafeAreaView style={s.container}>
+      <View style={s.header}>
+        <TouchableOpacity onPress={() => setStep('driver')} style={s.backBtn}>
+          <Text style={s.backBtnText}>‹ Back</Text>
+        </TouchableOpacity>
+        <Text style={s.appName}>FleetTracker</Text>
+        <Text style={s.subtitle}>
+          Hi, <Text style={{ color: C.blue }}>{selectedDriver?.name}</Text>. Pick your vehicle.
+        </Text>
+      </View>
+
+      <View style={s.stepIndicator}>
+        <View style={[s.stepDot, s.stepDotDone]} /><View style={[s.stepLine, s.stepLineDone]} />
+        <View style={[s.stepDot, s.stepDotActive]} />
+      </View>
+
+      <View style={s.sectionHeader}>
+        <Text style={s.label}>SELECT VEHICLE</Text>
+        <TouchableOpacity onPress={fetchVehicles}>
+          <Text style={s.refreshBtn}>↻ Refresh</Text>
+        </TouchableOpacity>
+      </View>
+
+      {loadingVehicles
+        ? <ActivityIndicator color={C.blue} style={{ marginTop: 20 }} />
+        : vehicles.length === 0
+          ? <EmptyState
+              message="No vehicles found"
+              sub="Ask your admin to add vehicles on the dashboard."
+              onRetry={fetchVehicles}
+            />
+          : (
+            <FlatList
+              data={vehicles}
+              keyExtractor={v => v._id}
+              style={{ flex: 1, marginTop: 8 }}
+              renderItem={({ item }) => {
+                const isSelected = selectedVehicle?._id === item._id;
+                const isTaken = item.isActive;
+                return (
+                  <TouchableOpacity
+                    style={[s.listItem, isSelected && s.listItemSelected, isTaken && s.listItemDim]}
+                    onPress={() => !isTaken && setSelectedVehicle(item)}
+                    disabled={isTaken}
+                  >
+                    <Text style={s.listItemIcon}>
+                      {item.type === 'truck' ? '🚛' : item.type === 'van' ? '🚐' :
+                       item.type === 'motorcycle' ? '🏍' : '🚗'}
+                    </Text>
+                    <View style={{ flex: 1 }}>
+                      <Text style={[s.listItemName, isSelected && s.listItemNameSelected]}>
+                        {item.name}
+                      </Text>
+                      {item.plateNumber && (
+                        <Text style={s.listItemSub}>{item.plateNumber}</Text>
+                      )}
+                      {isTaken && (
+                        <Text style={s.listItemBusy}>In use · {item.currentDriverName}</Text>
+                      )}
+                    </View>
+                    {isSelected && <Text style={s.check}>✓</Text>}
+                  </TouchableOpacity>
+                );
+              }}
+            />
+          )
+      }
+
+      <TouchableOpacity
+        style={[s.primaryBtn, (!selectedVehicle || startingShift) && s.primaryBtnDisabled]}
+        onPress={startShift}
+        disabled={!selectedVehicle || startingShift}
+      >
+        {startingShift
+          ? <ActivityIndicator color="#fff" />
+          : <Text style={s.primaryBtnText}>Start Shift</Text>
+        }
+      </TouchableOpacity>
+    </SafeAreaView>
+  );
+}
+
+// ─── Tracking Screen ───────────────────────────────────────────────────────────
+function TrackingScreen({ session, lastLocation, onEndShift }: {
+  session: { driver: Driver; vehicle: Vehicle; startedAt: string };
+  lastLocation: Location.LocationObject | null;
+  onEndShift: () => void;
+}) {
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    const t = setInterval(() => setTick(n => n + 1), 30_000);
+    return () => clearInterval(t);
   }, []);
 
-  async function bootstrapApp() {
-    // Get or generate a stable device ID
-    let driverId = await AsyncStorage.getItem(DRIVER_ID_KEY);
-    if (!driverId) {
-      driverId = `driver_${Device.modelId ?? 'unknown'}_${Date.now()}`;
-      await AsyncStorage.setItem(DRIVER_ID_KEY, driverId);
-    }
-
-    const deviceId = Device.osBuildId ?? Device.modelId ?? `device_${Date.now()}`;
-    await LocationService.init(deviceId, driverId);
-
-    // Auto-start if previously tracking (app was killed and restarted)
-    await startTracking();
-  }
-
-  // ── Tracking Control ──────────────────────────────────────────────────────
-
-  async function startTracking() {
-    setStatus('requesting');
-    setErrorMsg('');
-    try {
-      await LocationService.startTracking();
-
-      // Get an immediate position for display
-      const pos = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.High });
-      setLastLocation(pos);
-      setStatus('tracking');
-
-      // Always set up a foreground watch for live UI display.
-      // When background task is unavailable (Expo Go), this also drives location
-      // updates by calling LocationService.handleLocationUpdate directly.
-      Location.watchPositionAsync(
-        { accuracy: Location.Accuracy.High, timeInterval: 10_000, distanceInterval: 10 },
-        async (loc) => {
-          setLastLocation(loc);
-          // In foreground-only mode, pipe updates through the service manually
-          if (!LocationService.usingBackgroundTask) {
-            await LocationService.constructor.handleLocationUpdate
-              ? LocationService.constructor.handleLocationUpdate(loc)
-              : LocationService.handleLocationUpdate?.(loc);
-          }
-        }
-      );
-    } catch (err: any) {
-      setErrorMsg(err.message);
-      setStatus('error');
-      Alert.alert('Permission Required', err.message, [
-        { text: 'Open Settings', onPress: () => Location.enableNetworkProviderAsync() },
-        { text: 'Cancel', style: 'cancel' },
-      ]);
-    }
-  }
-
-  async function stopTracking() {
-    await LocationService.stopTracking();
-    setStatus('idle');
-  }
-
-  async function refreshQueueCount() {
-    const raw = await AsyncStorage.getItem('fleet_offline_queue');
-    const q = raw ? JSON.parse(raw) : [];
-    setQueueCount(q.length);
-  }
-
-  // ── Render ────────────────────────────────────────────────────────────────
-
-  const isTracking = status === 'tracking';
-  const coords = lastLocation?.coords;
+  const coords    = lastLocation?.coords;
+  const speedKmh  = coords?.speed != null && coords.speed >= 0
+    ? (coords.speed * 3.6).toFixed(1) : '0.0';
+  const mins      = Math.floor((Date.now() - new Date(session.startedAt).getTime()) / 60_000);
+  const duration  = mins < 60 ? `${mins} min` : `${Math.floor(mins / 60)}h ${mins % 60}m`;
 
   return (
-    <SafeAreaView style={styles.container}>
-      {/* Header */}
-      <View style={styles.header}>
-        <View style={styles.logoRow}>
-          <View style={[styles.dot, isTracking && styles.dotActive]} />
-          <Text style={styles.appName}>FleetTracker</Text>
+    <SafeAreaView style={s.container}>
+      <View style={s.header}>
+        <View style={s.liveBadge}>
+          <View style={s.liveDot} />
+          <Text style={s.liveText}>LIVE</Text>
         </View>
-        <Text style={styles.subtitle}>
-          {isTracking ? 'Transmitting location' : 'Not tracking'}
-        </Text>
+        <Text style={s.appName}>Shift Active</Text>
       </View>
 
-      {/* Status Card */}
-      <View style={styles.card}>
-        <Text style={styles.cardLabel}>STATUS</Text>
-        <View style={styles.statusRow}>
-          <View style={[styles.statusDot, isTracking ? styles.green : styles.grey]} />
-          <Text style={[styles.statusText, isTracking ? styles.greenText : styles.greyText]}>
-            {status === 'requesting' ? 'Requesting permissions...' :
-             isTracking ? 'Active & Transmitting' :
-             status === 'error' ? 'Permission Error' : 'Stopped'}
-          </Text>
-        </View>
-        {status === 'requesting' && <ActivityIndicator style={{ marginTop: 8 }} color="#1A73E8" />}
+      {/* Who + What */}
+      <View style={s.card}>
+        <Text style={s.cardDriver}>{session.driver.name}</Text>
+        {session.driver.employeeId && (
+          <Text style={s.cardEmployeeId}>ID: {session.driver.employeeId}</Text>
+        )}
+        <View style={s.divider} />
+        <Text style={s.cardVehicle}>{session.vehicle.name}</Text>
+        {session.vehicle.plateNumber && (
+          <Text style={s.cardPlate}>{session.vehicle.plateNumber}</Text>
+        )}
+        <Text style={s.cardDuration}>Duration: {duration}</Text>
       </View>
 
-      {/* Location Card */}
-      {coords && (
-        <View style={styles.card}>
-          <Text style={styles.cardLabel}>LAST KNOWN POSITION</Text>
-          <Text style={styles.coordText}>
-            {coords.latitude.toFixed(6)}, {coords.longitude.toFixed(6)}
-          </Text>
-          <View style={styles.metaRow}>
-            <Text style={styles.meta}>
-              Speed: {coords.speed != null ? `${(coords.speed * 3.6).toFixed(1)} km/h` : 'N/A'}
-            </Text>
-            <Text style={styles.meta}>
-              Accuracy: ±{coords.accuracy?.toFixed(0)}m
-            </Text>
+      {/* Live stats */}
+      <View style={s.statsRow}>
+        {[
+          { value: speedKmh, unit: 'km/h' },
+          { value: coords?.heading != null ? `${coords.heading.toFixed(0)}°` : '–', unit: 'heading' },
+          { value: coords?.accuracy != null ? `±${coords.accuracy.toFixed(0)}m` : '–', unit: 'accuracy' },
+        ].map((stat, i) => (
+          <View key={i} style={s.statCell}>
+            <Text style={s.statValue}>{stat.value}</Text>
+            <Text style={s.statUnit}>{stat.unit}</Text>
           </View>
-          {lastLocation?.timestamp && (
-            <Text style={styles.timestamp}>
-              Updated: {new Date(lastLocation.timestamp).toLocaleTimeString()}
+        ))}
+      </View>
+
+      {/* Coordinates */}
+      <View style={s.card}>
+        {coords ? (
+          <>
+            <Text style={s.coordsLabel}>CURRENT POSITION</Text>
+            <Text style={s.coordsText}>
+              {coords.latitude.toFixed(6)}, {coords.longitude.toFixed(6)}
             </Text>
-          )}
-        </View>
-      )}
-
-      {/* Offline Queue */}
-      <TouchableOpacity style={styles.card} onPress={refreshQueueCount}>
-        <Text style={styles.cardLabel}>OFFLINE QUEUE</Text>
-        <Text style={styles.queueCount}>{queueCount}</Text>
-        <Text style={styles.queueSub}>
-          {queueCount === 0
-            ? 'All locations synced ✓'
-            : `${queueCount} location(s) waiting to sync (tap to refresh)`}
-        </Text>
-      </TouchableOpacity>
-
-      {/* Error */}
-      {errorMsg ? (
-        <View style={styles.errorBox}>
-          <Text style={styles.errorText}>{errorMsg}</Text>
-        </View>
-      ) : null}
-
-      {/* Control Button */}
-      <View style={styles.buttonRow}>
-        {isTracking ? (
-          <TouchableOpacity style={[styles.btn, styles.stopBtn]} onPress={stopTracking}>
-            <Text style={styles.btnText}>Stop Tracking</Text>
-          </TouchableOpacity>
+            {lastLocation?.timestamp && (
+              <Text style={s.coordsTime}>
+                Updated: {new Date(lastLocation.timestamp).toLocaleTimeString()}
+              </Text>
+            )}
+          </>
         ) : (
-          <TouchableOpacity
-            style={[styles.btn, styles.startBtn, status === 'requesting' && styles.btnDisabled]}
-            onPress={startTracking}
-            disabled={status === 'requesting'}
-          >
-            <Text style={styles.btnText}>
-              {status === 'requesting' ? 'Starting...' : 'Start Tracking'}
-            </Text>
-          </TouchableOpacity>
+          <>
+            <ActivityIndicator color={C.blue} />
+            <Text style={[s.coordsLabel, { marginTop: 8 }]}>Acquiring GPS signal…</Text>
+          </>
         )}
       </View>
 
-      <Text style={styles.footer}>
-        {LocationService.usingBackgroundTask
-          ? Platform.OS === 'android'
-            ? 'Running as Foreground Service on Android'
-            : 'Running in Background on iOS'
-          : '⚠ Foreground-only mode (build a dev build for background tracking)'}
+      <View style={{ flex: 1 }} />
+
+      <TouchableOpacity style={s.endBtn} onPress={onEndShift}>
+        <Text style={s.endBtnText}>End Shift</Text>
+      </TouchableOpacity>
+      <Text style={s.footer}>
+        {Platform.OS === 'android' ? 'Running as Foreground Service' : 'Background location active'}
       </Text>
     </SafeAreaView>
   );
 }
 
+// ─── Empty State ───────────────────────────────────────────────────────────────
+function EmptyState({ message, sub, onRetry }: { message: string; sub: string; onRetry: () => void }) {
+  return (
+    <View style={s.empty}>
+      <Text style={s.emptyTitle}>{message}</Text>
+      <Text style={s.emptySub}>{sub}</Text>
+      <TouchableOpacity style={s.retryBtn} onPress={onRetry}>
+        <Text style={s.retryText}>Try Again</Text>
+      </TouchableOpacity>
+    </View>
+  );
+}
+
 // ─── Styles ────────────────────────────────────────────────────────────────────
-const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: '#0D1117', padding: 20 },
+const C = { bg:'#0D1117', surface:'#161B22', border:'#21262D',
+            text:'#E6EDF3', muted:'#8B949E', dim:'#444D56',
+            blue:'#1A73E8', green:'#00E676', red:'#FF453A' };
 
-  header: { marginBottom: 28 },
-  logoRow: { flexDirection: 'row', alignItems: 'center', gap: 10 },
-  dot: { width: 12, height: 12, borderRadius: 6, backgroundColor: '#444' },
-  dotActive: { backgroundColor: '#00E676', shadowColor: '#00E676', shadowRadius: 8, shadowOpacity: 0.8 },
-  appName: { fontSize: 24, fontWeight: '700', color: '#FFFFFF', letterSpacing: 1 },
-  subtitle: { color: '#8B949E', marginTop: 4, fontSize: 13 },
+const s = StyleSheet.create({
+  container:    { flex:1, backgroundColor:C.bg, padding:20 },
+  loadingText:  { color:C.muted, marginTop:12, textAlign:'center' },
 
-  card: {
-    backgroundColor: '#161B22',
-    borderRadius: 12,
-    padding: 16,
-    marginBottom: 12,
-    borderWidth: 1,
-    borderColor: '#21262D',
-  },
-  cardLabel: { fontSize: 10, color: '#8B949E', letterSpacing: 2, marginBottom: 8 },
+  header:    { marginBottom:16 },
+  appName:   { fontSize:24, fontWeight:'700', color:C.text },
+  subtitle:  { color:C.muted, marginTop:4, fontSize:14 },
+  backBtn:   { marginBottom:4 },
+  backBtnText: { color:C.blue, fontSize:14 },
 
-  statusRow: { flexDirection: 'row', alignItems: 'center', gap: 8 },
-  statusDot: { width: 8, height: 8, borderRadius: 4 },
-  green: { backgroundColor: '#00E676' },
-  grey: { backgroundColor: '#555' },
-  statusText: { fontSize: 16, fontWeight: '600' },
-  greenText: { color: '#00E676' },
-  greyText: { color: '#8B949E' },
+  stepIndicator: { flexDirection:'row', alignItems:'center', marginBottom:20 },
+  stepDot:       { width:10, height:10, borderRadius:5, backgroundColor:C.border },
+  stepDotActive: { backgroundColor:C.blue },
+  stepDotDone:   { backgroundColor:C.green },
+  stepLine:      { flex:1, height:1, backgroundColor:C.border, marginHorizontal:6 },
+  stepLineDone:  { backgroundColor:C.green },
 
-  coordText: { fontSize: 18, color: '#E6EDF3', fontWeight: '600', marginBottom: 8, fontVariant: ['tabular-nums'] },
-  metaRow: { flexDirection: 'row', gap: 16 },
-  meta: { color: '#8B949E', fontSize: 13 },
-  timestamp: { color: '#444D56', fontSize: 12, marginTop: 4 },
+  sectionHeader: { flexDirection:'row', justifyContent:'space-between', alignItems:'center', marginBottom:8 },
+  label:         { fontSize:10, letterSpacing:2, color:C.muted, textTransform:'uppercase' },
+  refreshBtn:    { color:C.blue, fontSize:13 },
 
-  queueCount: { fontSize: 36, fontWeight: '700', color: '#E6EDF3' },
-  queueSub: { color: '#8B949E', fontSize: 13, marginTop: 2 },
+  listItem:         { flexDirection:'row', alignItems:'center', gap:12, backgroundColor:C.surface,
+                      borderWidth:1, borderColor:C.border, borderRadius:10, padding:14, marginBottom:8 },
+  listItemSelected: { borderColor:C.blue, backgroundColor:'#0D2137' },
+  listItemDim:      { opacity:0.4 },
+  listItemIcon:     { fontSize:24 },
+  listItemName:     { fontSize:15, fontWeight:'600', color:C.text },
+  listItemNameSelected: { color:C.blue },
+  listItemSub:      { fontSize:11, color:C.muted, letterSpacing:1, marginTop:2 },
+  listItemBusy:     { fontSize:11, color:C.red, marginTop:2 },
+  check:            { fontSize:18, color:C.blue, fontWeight:'700' },
 
-  errorBox: { backgroundColor: '#2D1B1B', borderRadius: 8, padding: 12, marginBottom: 12, borderWidth: 1, borderColor: '#FF453A' },
-  errorText: { color: '#FF453A', fontSize: 13 },
+  primaryBtn:         { backgroundColor:C.blue, padding:16, borderRadius:12, alignItems:'center', marginTop:8 },
+  primaryBtnDisabled: { opacity:0.4 },
+  primaryBtnText:     { color:'#fff', fontWeight:'700', fontSize:16 },
 
-  buttonRow: { marginTop: 8 },
-  btn: { padding: 16, borderRadius: 12, alignItems: 'center' },
-  startBtn: { backgroundColor: '#1A73E8' },
-  stopBtn: { backgroundColor: '#3A1A1A', borderWidth: 1, borderColor: '#FF453A' },
-  btnDisabled: { opacity: 0.5 },
-  btnText: { color: '#fff', fontWeight: '700', fontSize: 16 },
+  // Tracking
+  liveBadge: { flexDirection:'row', alignItems:'center', gap:6, marginBottom:4 },
+  liveDot:   { width:8, height:8, borderRadius:4, backgroundColor:C.green },
+  liveText:  { fontSize:11, fontWeight:'700', color:C.green, letterSpacing:2 },
 
-  footer: { textAlign: 'center', color: '#30363D', fontSize: 11, marginTop: 16 },
+  card:           { backgroundColor:C.surface, borderRadius:12, padding:16,
+                    borderWidth:1, borderColor:C.border, marginBottom:12 },
+  cardDriver:     { fontSize:22, fontWeight:'700', color:C.text },
+  cardEmployeeId: { fontSize:11, color:C.muted, marginTop:2 },
+  divider:        { height:1, backgroundColor:C.border, marginVertical:10 },
+  cardVehicle:    { fontSize:15, fontWeight:'600', color:C.muted },
+  cardPlate:      { alignSelf:'flex-start', marginTop:4, fontSize:11, letterSpacing:2, color:C.muted,
+                    backgroundColor:'#21262D', paddingHorizontal:8, paddingVertical:2, borderRadius:4 },
+  cardDuration:   { fontSize:12, color:C.dim, marginTop:8 },
+
+  statsRow:  { flexDirection:'row', gap:8, marginBottom:12 },
+  statCell:  { flex:1, backgroundColor:C.surface, borderRadius:10, borderWidth:1,
+               borderColor:C.border, padding:14, alignItems:'center' },
+  statValue: { fontSize:20, fontWeight:'700', color:'#38BDF8', fontVariant:['tabular-nums'] },
+  statUnit:  { fontSize:10, color:C.muted, marginTop:4, letterSpacing:1 },
+
+  coordsLabel: { fontSize:9, letterSpacing:2, color:C.dim, marginBottom:6, textTransform:'uppercase' },
+  coordsText:  { fontSize:15, color:C.text, fontVariant:['tabular-nums'] },
+  coordsTime:  { fontSize:11, color:C.dim, marginTop:4 },
+
+  endBtn:     { padding:16, borderRadius:12, alignItems:'center',
+                backgroundColor:'#1A0A0A', borderWidth:1, borderColor:C.red },
+  endBtnText: { color:C.red, fontWeight:'700', fontSize:16 },
+  footer:     { textAlign:'center', color:C.dim, fontSize:11, marginTop:12 },
+
+  empty:      { flex:1, alignItems:'center', justifyContent:'center', paddingTop:40 },
+  emptyTitle: { color:C.text, fontSize:16, fontWeight:'600' },
+  emptySub:   { color:C.muted, fontSize:13, textAlign:'center', marginTop:8, paddingHorizontal:20 },
+  retryBtn:   { marginTop:16, padding:10, borderRadius:8, borderWidth:1, borderColor:C.border },
+  retryText:  { color:C.blue, fontSize:13 },
 });

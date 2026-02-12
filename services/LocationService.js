@@ -12,7 +12,7 @@ import NetInfo from '@react-native-community/netinfo';
 
 const BACKGROUND_LOCATION_TASK = 'background-location-task';
 const OFFLINE_QUEUE_KEY = 'fleet_offline_queue';
-const API_BASE_URL = process.env.EXPO_PUBLIC_API_URL || 'https://658e-105-165-217-230.ngrok-free.app';
+let API_BASE_URL = 'http://localhost:4000'; // set dynamically via init()
 
 // ─── Background Task Definition ────────────────────────────────────────────────
 // Must be defined at the TOP LEVEL (outside any component/class).
@@ -38,19 +38,22 @@ try {
 // ─── LocationService Class ──────────────────────────────────────────────────────
 class LocationService {
   constructor() {
-    this.deviceId = null;
+    this.vehicleId = null;
     this.driverId = null;
     this.isTracking = false;
+    this.usingBackgroundTask = false;
     this.syncInterval = null;
+    this.foregroundCallback = null;
   }
 
   /**
    * Call once on app launch with device/driver identifiers.
    */
-  async init(deviceId, driverId) {
-    this.deviceId = deviceId;
+  async init(apiBase, vehicleId, driverId) {
+    API_BASE_URL = apiBase;
+    this.vehicleId = vehicleId;
     this.driverId = driverId;
-    // Start background sync loop every 30 seconds
+    if (this.syncInterval) clearInterval(this.syncInterval);
     this.syncInterval = setInterval(() => this.flushQueue(), 30_000);
   }
 
@@ -77,7 +80,8 @@ class LocationService {
 
   // ── Start / Stop Tracking ──────────────────────────────────────────────────
 
-  async startTracking() {
+  async startTracking(onLocationUpdate = null) {
+    this.foregroundCallback = onLocationUpdate;
     await this.requestPermissions();
 
     // Try to register background location task.
@@ -147,6 +151,7 @@ class LocationService {
       timestamp: new Date(location.timestamp).toISOString(),
     };
 
+    if (instance.foregroundCallback) instance.foregroundCallback(location);
     const netState = await NetInfo.fetch();
     if (netState.isConnected) {
       const sent = await LocationService.postLocation(payload);
@@ -192,6 +197,7 @@ class LocationService {
    * Flush the offline queue in batches when connectivity is restored.
    */
   async flushQueue() {
+    if (instance.foregroundCallback) instance.foregroundCallback(location);
     const netState = await NetInfo.fetch();
     if (!netState.isConnected) return;
 
