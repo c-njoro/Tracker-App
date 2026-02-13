@@ -12,7 +12,7 @@ import NetInfo from '@react-native-community/netinfo';
 
 const BACKGROUND_LOCATION_TASK = 'background-location-task';
 const OFFLINE_QUEUE_KEY = 'fleet_offline_queue';
-let API_BASE_URL = 'https://29a2-105-165-217-230.ngrok-free.app'; // set dynamically via init()
+let API_BASE_URL = 'https://6685-105-165-217-230.ngrok-free.app'; // set dynamically via init()
 
 // ─── Background Task Definition ────────────────────────────────────────────────
 // Must be at TOP LEVEL. Wrapped in try/catch — Expo Go can't register bg tasks.
