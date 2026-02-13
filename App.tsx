@@ -16,7 +16,7 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import LocationService from './services/LocationService';
 
 // ─── Set this to your backend LAN IP ──────────────────────────────────────────
-const API = 'https://658e-105-165-217-230.ngrok-free.app';  // ← change to your server's IP
+const API = 'https://29a2-105-165-217-230.ngrok-free.app';  // ← change to your server's IP
 // ──────────────────────────────────────────────────────────────────────────────
 
 const SESSION_KEY = 'fleet_active_session';
