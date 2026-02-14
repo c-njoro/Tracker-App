@@ -12,7 +12,7 @@ import NetInfo from '@react-native-community/netinfo';
 
 const BACKGROUND_LOCATION_TASK = 'background-location-task';
 const OFFLINE_QUEUE_KEY = 'fleet_offline_queue';
-let API_BASE_URL = 'https://6685-105-165-217-230.ngrok-free.app'; // set dynamically via init()
+let API_BASE_URL = 'https://tracker-db-4ya3.onrender.com'; // set dynamically via init()
 
 // ─── Background Task Definition ────────────────────────────────────────────────
 // Must be at TOP LEVEL. Wrapped in try/catch — Expo Go can't register bg tasks.
@@ -50,7 +50,7 @@ class LocationService {
     this.usingBackgroundTask = false;
     this.syncInterval = null;
     this.foregroundCallback = null;
-    this.foregroundSubscription = null; // <-- NEW: hold foreground watcher
+    this.foregroundSubscription = null;
   }
 
   async init(apiBase, vehicleId, driverId) {
@@ -112,8 +112,7 @@ class LocationService {
     } catch (bgError) {
       // --- FALLBACK: Foreground-only mode ---
       console.warn('[LocationService] Background task failed, falling back to foreground-only mode:', bgError.message);
-      
-      // Start a foreground watcher that calls the same handler
+
       this.foregroundSubscription = await Location.watchPositionAsync(
         {
           accuracy: Location.Accuracy.High,
@@ -140,15 +139,33 @@ class LocationService {
       console.warn('[LocationService] stopTracking error:', e.message);
     }
 
-    // Remove foreground subscription if active
     if (this.foregroundSubscription) {
       this.foregroundSubscription.remove();
       this.foregroundSubscription = null;
     }
 
-    if (this.syncInterval) clearInterval(this.syncInterval);
+    if (this.syncInterval) {
+      clearInterval(this.syncInterval);
+      this.syncInterval = null;
+    }
+
     this.isTracking = false;
+    this.vehicleId = null;
+    this.driverId = null;
     console.log('[LocationService] Tracking stopped.');
+  }
+
+  // ── Clear offline queue ────────────────────────────────────────────────────
+  // Call this when a shift ends or a new shift starts to prevent stale pings
+  // from a previous session being uploaded and corrupting the new shift's data.
+
+  async clearQueue() {
+    try {
+      await AsyncStorage.removeItem(OFFLINE_QUEUE_KEY);
+      console.log('[LocationService] Offline queue cleared.');
+    } catch (err) {
+      console.error('[LocationService] clearQueue error:', err.message);
+    }
   }
 
   // ── Location Update Handler ────────────────────────────────────────────────
@@ -156,7 +173,7 @@ class LocationService {
   static async handleLocationUpdate(location) {
     const instance = LocationService.instance;
 
-    // --- GUARD: Don't send if vehicle/driver not set ---
+    // Guard: don't send if vehicle/driver not set
     if (!instance.vehicleId || !instance.driverId) {
       console.warn('[LocationService] Skipping location – vehicleId/driverId not set');
       return;
@@ -201,7 +218,7 @@ class LocationService {
         `${API_BASE_URL}/api/locations`,
         {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json', "ngrok-skip-browser-warning": "true"  },
+          headers: { 'Content-Type': 'application/json', 'ngrok-skip-browser-warning': 'true' },
           body: JSON.stringify(payload),
         },
         8000
@@ -229,7 +246,6 @@ class LocationService {
   }
 
   async flushQueue() {
-    // NOTE: no location/foregroundCallback call here — this is a background sync
     try {
       const netState = await NetInfo.fetch();
       if (!netState.isConnected) return;
@@ -238,6 +254,12 @@ class LocationService {
       if (!raw) return;
       const queue = JSON.parse(raw);
       if (queue.length === 0) return;
+
+      // Guard: don't flush if no active shift — prevents stale data upload
+      if (!this.vehicleId || !this.driverId) {
+        console.warn('[LocationService] Skipping flush — no active shift');
+        return;
+      }
 
       console.log(`[LocationService] Flushing ${queue.length} queued pings...`);
 
@@ -250,7 +272,7 @@ class LocationService {
             `${API_BASE_URL}/api/locations/batch`,
             {
               method: 'POST',
-              headers: { 'Content-Type': 'application/json', "ngrok-skip-browser-warning": "true"  },
+              headers: { 'Content-Type': 'application/json', 'ngrok-skip-browser-warning': 'true' },
               body: JSON.stringify({ locations: chunk }),
             },
             15_000
@@ -258,7 +280,7 @@ class LocationService {
           if (res.ok) sent += chunk.length;
           else break;
         } catch {
-          break; // Network issue — retry next interval
+          break;
         }
       }
 

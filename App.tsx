@@ -28,7 +28,7 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import LocationService from './services/LocationService';
 
 // ─── Config ────────────────────────────────────────────────────────────────────
-const API              = 'https://6685-105-165-217-230.ngrok-free.app';
+const API              = 'https://tracker-db-4ya3.onrender.com';
 const POLL_INTERVAL_MS = 30_000;
 const SESSION_KEY      = 'fleet_active_session';
 const REGISTRATION_KEY = 'fleet_driver_registration';
@@ -162,6 +162,7 @@ export default function App() {
       };
 
       stopPolling();
+      await LocationService.clearQueue(); // ← discard any stale pings before new shift
       await LocationService.init(API, data.vehicle._id, driver._id);
       await LocationService.startTracking((loc) => setLastLocation(loc));
       await AsyncStorage.setItem(SESSION_KEY, JSON.stringify(session));
@@ -206,6 +207,7 @@ export default function App() {
   // ── Stop tracking & return to waiting ─────────────────────────────────────────
   async function doStopTracking(driver: Driver) {
     await LocationService.stopTracking();
+    await LocationService.clearQueue(); // ← discard stale offline pings from ended shift
     await AsyncStorage.removeItem(SESSION_KEY);
     setActiveSession(null);
     setLastLocation(null);
