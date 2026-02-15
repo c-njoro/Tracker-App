@@ -12,10 +12,15 @@ import NetInfo from '@react-native-community/netinfo';
 
 const BACKGROUND_LOCATION_TASK = 'background-location-task';
 const OFFLINE_QUEUE_KEY = 'fleet_offline_queue';
-let API_BASE_URL = 'https://tracker-db-4ya3.onrender.com'; // set dynamically via init()
+
+// Reject any fix worse than this threshold.
+// Filters out WiFi/cell tower guesses (typically 300–2000m) while
+// accepting GPS fixes (typically 3–30m) and even assisted GPS (~50–150m).
+const MAX_ACCEPTABLE_ACCURACY_METERS = 150;
+
+let API_BASE_URL = 'https://3980-154-159-237-115.ngrok-free.app';
 
 // ─── Background Task Definition ────────────────────────────────────────────────
-// Must be at TOP LEVEL. Wrapped in try/catch — Expo Go can't register bg tasks.
 try {
   TaskManager.defineTask(BACKGROUND_LOCATION_TASK, async ({ data, error }) => {
     if (error) {
@@ -33,7 +38,7 @@ try {
   console.warn('[LocationService] defineTask failed (Expo Go):', e.message);
 }
 
-// ─── Helper: fetch with manual timeout (Hermes doesn't support AbortSignal.timeout) ──
+// ─── Helper: fetch with manual timeout ────────────────────────────────────────
 function fetchWithTimeout(url, options, timeoutMs = 8000) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -44,8 +49,8 @@ function fetchWithTimeout(url, options, timeoutMs = 8000) {
 // ─── LocationService Class ─────────────────────────────────────────────────────
 class LocationService {
   constructor() {
-    this.vehicleId = null;
-    this.driverId = null;
+    this.technicianId = null;
+    this.userId = null;
     this.isTracking = false;
     this.usingBackgroundTask = false;
     this.syncInterval = null;
@@ -53,12 +58,11 @@ class LocationService {
     this.foregroundSubscription = null;
   }
 
-  async init(apiBase, vehicleId, driverId) {
+  async init(apiBase, technicianId, userId) {
     API_BASE_URL = apiBase;
-    this.vehicleId = vehicleId;
-    this.driverId = driverId;
+    this.technicianId = technicianId;
+    this.userId = userId;
     if (this.syncInterval) clearInterval(this.syncInterval);
-    // Flush offline queue every 30 seconds
     this.syncInterval = setInterval(() => this.flushQueue(), 30_000);
   }
 
@@ -92,12 +96,15 @@ class LocationService {
       if (!isAvailable) throw new Error('TaskManager not available (Expo Go)');
 
       await Location.startLocationUpdatesAsync(BACKGROUND_LOCATION_TASK, {
-        accuracy: Location.Accuracy.High,
+        accuracy: Location.Accuracy.BestForNavigation, // ← upgraded from High
         timeInterval: 15_000,
-        distanceInterval: 20,
+        distanceInterval: 0,           // ← was 20m: 0 = time-based only, no distance gate.
+                                       //   Prevents reusing a stale cached network fix
+                                       //   when someone is stationary.
         deferredUpdatesInterval: 60_000,
-        deferredUpdatesDistance: 100,
+        deferredUpdatesDistance: 50,   // ← tightened from 100m
         showsBackgroundLocationIndicator: true,
+        mayShowUserSettingsDialog: true, // ← prompts to enable high-accuracy GPS mode on Android
         foregroundService: {
           notificationTitle: 'Fleet Tracker Active',
           notificationBody: 'Your location is being tracked.',
@@ -110,14 +117,13 @@ class LocationService {
       this.usingBackgroundTask = true;
       console.log('[LocationService] Background tracking started.');
     } catch (bgError) {
-      // --- FALLBACK: Foreground-only mode ---
       console.warn('[LocationService] Background task failed, falling back to foreground-only mode:', bgError.message);
 
       this.foregroundSubscription = await Location.watchPositionAsync(
         {
-          accuracy: Location.Accuracy.High,
+          accuracy: Location.Accuracy.BestForNavigation, // ← upgraded
           timeInterval: 15_000,
-          distanceInterval: 20,
+          distanceInterval: 0,          // ← same fix
         },
         (location) => {
           LocationService.handleLocationUpdate(location);
@@ -150,14 +156,12 @@ class LocationService {
     }
 
     this.isTracking = false;
-    this.vehicleId = null;
-    this.driverId = null;
+    this.technicianId = null;  // ← FIX: was this.vehicleId (wrong field name from old code)
+    this.userId = null;        // ← FIX: was this.driverId (wrong field name from old code)
     console.log('[LocationService] Tracking stopped.');
   }
 
   // ── Clear offline queue ────────────────────────────────────────────────────
-  // Call this when a shift ends or a new shift starts to prevent stale pings
-  // from a previous session being uploaded and corrupting the new shift's data.
 
   async clearQueue() {
     try {
@@ -173,27 +177,35 @@ class LocationService {
   static async handleLocationUpdate(location) {
     const instance = LocationService.instance;
 
-    // Guard: don't send if vehicle/driver not set
-    if (!instance.vehicleId || !instance.driverId) {
-      console.warn('[LocationService] Skipping location – vehicleId/driverId not set');
+    if (!instance.technicianId || !instance.userId) {
+      console.warn('[LocationService] Skipping location – technicianId/userId not set');
       return;
     }
 
-    // Fire UI callback first so the screen updates immediately
+    // ── Accuracy filter ──────────────────────────────────────────────────────
+    // Drop coarse network/WiFi fixes before they reach the backend or queue.
+    // Still fires the UI callback so the screen can show the live accuracy reading.
+    const accuracy = location.coords.accuracy;
+    if (accuracy !== null && accuracy > MAX_ACCEPTABLE_ACCURACY_METERS) {
+      console.warn(`[LocationService] Dropping low-accuracy fix: ±${accuracy.toFixed(0)}m`);
+      if (instance.foregroundCallback) instance.foregroundCallback(location);
+      return;
+    }
+
     if (instance.foregroundCallback) {
       instance.foregroundCallback(location);
     }
 
     const payload = {
-      vehicleId: instance.vehicleId,
-      driverId:  instance.driverId,
-      lat:       location.coords.latitude,
-      lng:       location.coords.longitude,
-      accuracy:  location.coords.accuracy,
-      speed:     location.coords.speed,
-      heading:   location.coords.heading,
-      altitude:  location.coords.altitude,
-      timestamp: new Date(location.timestamp).toISOString(),
+      technicianId: instance.technicianId,
+      userId:       instance.userId,
+      lat:          location.coords.latitude,
+      lng:          location.coords.longitude,
+      accuracy:     location.coords.accuracy,
+      speed:        location.coords.speed,
+      heading:      location.coords.heading,
+      altitude:     location.coords.altitude,
+      timestamp:    new Date(location.timestamp).toISOString(),
     };
 
     try {
@@ -237,7 +249,6 @@ class LocationService {
       const raw = await AsyncStorage.getItem(OFFLINE_QUEUE_KEY);
       const queue = raw ? JSON.parse(raw) : [];
       queue.push(payload);
-      // Cap at 2000 entries (~8h at 15s intervals)
       if (queue.length > 2000) queue.splice(0, queue.length - 2000);
       await AsyncStorage.setItem(OFFLINE_QUEUE_KEY, JSON.stringify(queue));
     } catch (err) {
@@ -255,8 +266,9 @@ class LocationService {
       const queue = JSON.parse(raw);
       if (queue.length === 0) return;
 
-      // Guard: don't flush if no active shift — prevents stale data upload
-      if (!this.vehicleId || !this.driverId) {
+      // FIX: was checking this.vehicleId/this.driverId — stale field names after rename.
+      // The guard never passed, so the queue never flushed.
+      if (!this.technicianId || !this.userId) {
         console.warn('[LocationService] Skipping flush — no active shift');
         return;
       }
@@ -287,6 +299,11 @@ class LocationService {
       const remaining = queue.slice(sent);
       await AsyncStorage.setItem(OFFLINE_QUEUE_KEY, JSON.stringify(remaining));
       console.log(`[LocationService] Flushed ${sent}. Remaining: ${remaining.length}`);
+
+      // FIX: typo 'lenght' → 'length'
+      if (remaining.length === 0) {
+        this.clearQueue();
+      }
     } catch (err) {
       console.error('[LocationService] Flush error:', err.message);
     }

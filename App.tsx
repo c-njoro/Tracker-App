@@ -8,11 +8,14 @@
  *  'tracking'  → Shift active — live GPS stats + End Shift button
  *
  * Flow:
- *  1. Employee registers once on the app (name, phone, employee ID)
- *  2. App shows waiting screen and polls GET /api/drivers/:id/shift-status every 30s
- *  3. When admin assigns a vehicle + starts shift on dashboard, poll detects it
- *  4. LocationService starts automatically, app moves to tracking screen
- *  5. Tracking screen also polls every 30s — when admin ends shift, app returns to waiting
+ *  1. On boot, check with server if this device is already registered (using deviceId)
+ *  2. If server confirms registration, store user data locally and go to waiting.
+ *  3. If server says not registered (or unreachable), fallback to local storage.
+ *  4. If still no registration, show register screen.
+ *  5. Once registered, app shows waiting screen and polls GET /api/users/:id/shift-status every 30s.
+ *  6. When admin assigns a vehicle + starts shift on dashboard, poll detects it.
+ *  7. LocationService starts automatically, app moves to tracking screen.
+ *  8. Tracking screen also polls every 30s — when admin ends shift, app returns to waiting.
  */
 
 import React, { useCallback, useEffect, useRef, useState } from 'react';
@@ -21,66 +24,80 @@ import {
   StyleSheet, Text, TextInput,
   TouchableOpacity, View,
 } from 'react-native';
-import { SafeAreaView } from 'react-native-safe-area-context'; // ✅ Updated import
+import { SafeAreaView } from 'react-native-safe-area-context';
 import * as Location from 'expo-location';
 import * as Device from 'expo-device';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import LocationService from './services/LocationService';
+import axios from 'axios';
 
 // ─── Config ────────────────────────────────────────────────────────────────────
-const API              = 'https://tracker-db-4ya3.onrender.com';
-const POLL_INTERVAL_MS = 30_000;
+const API              = 'https://3980-154-159-237-115.ngrok-free.app';
+const POLL_INTERVAL_MS = 10_000;
 const SESSION_KEY      = 'fleet_active_session';
 const REGISTRATION_KEY = 'fleet_driver_registration';
 
 // ─── Types ─────────────────────────────────────────────────────────────────────
-interface Driver {
+interface User {
   _id: string;
   name: string;
-  employeeId?: string;
-  phone?: string;
+  employeeId: string;
   onShift: boolean;
 }
 
-interface Vehicle {
+interface Response {
+  success: boolean;
+  message: string;
+  data?: any;
+}
+
+interface Technician {
   _id: string;
   name: string;
-  plateNumber?: string;
-  type: string;
+  employeeId: string;
   isActive: boolean;
-  inUse: boolean;
-  currentDriverName?: string;
+  inShift: boolean;
+  userId?: string;
 }
 
 interface ActiveSession {
-  driver: Driver;
-  vehicle: Vehicle;
+  user: User;
+  technician: Technician;
   startedAt: string;
 }
 
 type Screen = 'loading' | 'register' | 'waiting' | 'tracking';
 
+// ─── Helper: get deviceId (consistent with registration) ───────────────────────
+function getDeviceId(): string {
+  return (
+    Device.osBuildId ??
+    Device.modelId ??
+    `device_${Date.now()}`
+  );
+}
+
 // ─── App ───────────────────────────────────────────────────────────────────────
 export default function App() {
-  const [screen, setScreen]                     = useState<Screen>('loading');
-  const [registeredDriver, setRegisteredDriver] = useState<Driver | null>(null);
-  const [activeSession, setActiveSession]       = useState<ActiveSession | null>(null);
-  const [lastLocation, setLastLocation]         = useState<Location.LocationObject | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [screen, setScreen] = useState<Screen>('loading');
+  const [registeredUser, setRegisteredUser] = useState<User | null>(null);
+  const [activeSession, setActiveSession] = useState<ActiveSession | null>(null);
+  const [lastLocation, setLastLocation] = useState<Location.LocationObject | null>(null);
 
   // Registration form
-  const [regName, setRegName]         = useState('');
-  const [regPhone, setRegPhone]       = useState('');
-  const [regEmpId, setRegEmpId]       = useState('');
+  const [regName, setRegName] = useState('');
+  const [regEmpId, setRegEmpId] = useState('');
   const [registering, setRegistering] = useState(false);
 
   // Polling feedback shown on waiting screen
   const [lastPollTime, setLastPollTime] = useState<Date | null>(null);
-  const [pollError, setPollError]       = useState(false);
+  const [pollError, setPollError] = useState(false);
 
   // Use a ref for the interval so it doesn't need to be in dependency arrays
   const pollIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  // ── Boot ─────────────────────────────────────────────────────────────────────
+  // ─── Boot: determine initial screen ───────────────────────────────────────────
   useEffect(() => {
     boot();
     return () => stopPolling();
@@ -93,24 +110,47 @@ export default function App() {
       if (sessionRaw) {
         const session: ActiveSession = JSON.parse(sessionRaw);
         setActiveSession(session);
-        await LocationService.init(API, session.vehicle._id, session.driver._id);
+        await LocationService.init(API, session.technician._id, session.user._id);
         await LocationService.startTracking((loc) => setLastLocation(loc));
         setScreen('tracking');
         return;
       }
 
-      // 2. Already registered — go straight to waiting screen
+      // 2. Check with server if this device is already registered
+      // GET with ?deviceId=<id> — route changed from POST to GET
+      const deviceId = getDeviceId();
+      try {
+        const { data } = await axios.get<Response>(
+          `${API}/api/users/check-registered?deviceId=${encodeURIComponent(deviceId)}`,
+          { headers: { 'ngrok-skip-browser-warning': 'true' } }
+        );
+        if (data.success) {
+          const user = data.data as User;
+          // Store locally for future boots
+          await AsyncStorage.setItem(REGISTRATION_KEY, JSON.stringify(user));
+          setRegisteredUser(user);
+          setScreen('waiting');
+          return;
+        }
+      } catch (err: any) {
+        // 404 means device not registered — fall back to local storage
+        // Any other error (network, server down) also falls back
+        console.log('Registration check failed, falling back to local storage', err.message);
+      }
+
+      // 3. Fallback: check local storage for existing registration
       const regRaw = await AsyncStorage.getItem(REGISTRATION_KEY);
       if (regRaw) {
-        const driver: Driver = JSON.parse(regRaw);
-        setRegisteredDriver(driver);
+        const user: User = JSON.parse(regRaw);
+        setRegisteredUser(user);
         setScreen('waiting');
         return;
       }
 
-      // 3. First launch — show registration form
+      // 4. No registration found anywhere – show register screen
       setScreen('register');
-    } catch {
+    } catch (error) {
+      // In case of any catastrophic error, go to register
       setScreen('register');
     }
   }
@@ -124,10 +164,10 @@ export default function App() {
   }
 
   // Passed a driver so it doesn't depend on state that may be stale inside setInterval
-  const runPoll = useCallback(async (driver: Driver, isTrackingPoll = false) => {
+  const runPoll = useCallback(async (user: User, isTrackingPoll = false) => {
     try {
       const res = await fetch(
-        `${API}/api/drivers/${driver._id}/shift-status`,
+        `${API}/api/users/${user._id}/shift-status`,
         { headers: { 'ngrok-skip-browser-warning': 'true' } }
       );
 
@@ -140,30 +180,30 @@ export default function App() {
 
       const data: {
         onShift: boolean;
-        vehicle: Vehicle | null;
+        technician: Technician | null;
         shiftStartedAt: string | null;
       } = await res.json();
 
       if (isTrackingPoll) {
         // During active tracking: detect when admin ends the shift
         if (!data.onShift) {
-          await doStopTracking(driver);
+          await doStopTracking(user);
         }
         return;
       }
 
       // During waiting: detect when admin starts a shift
-      if (!data.onShift || !data.vehicle) return;
+      if (!data.onShift || !data.technician) return;
 
       const session: ActiveSession = {
-        driver,
-        vehicle:   data.vehicle,
+        user,
+        technician: data.technician,
         startedAt: data.shiftStartedAt ?? new Date().toISOString(),
       };
 
       stopPolling();
       await LocationService.clearQueue(); // ← discard any stale pings before new shift
-      await LocationService.init(API, data.vehicle._id, driver._id);
+      await LocationService.init(API, data.technician._id, user._id);
       await LocationService.startTracking((loc) => setLastLocation(loc));
       await AsyncStorage.setItem(SESSION_KEY, JSON.stringify(session));
       setActiveSession(session);
@@ -175,29 +215,29 @@ export default function App() {
 
   // ── Start waiting poll when screen = 'waiting' ────────────────────────────────
   useEffect(() => {
-    if (screen !== 'waiting' || !registeredDriver) {
+    if (screen !== 'waiting' || !registeredUser) {
       stopPolling();
       return;
     }
 
-    const driver = registeredDriver;
-    runPoll(driver);                                         // immediate first check
+    const user = registeredUser;
+    runPoll(user);                                         // immediate first check
     pollIntervalRef.current = setInterval(
-      () => runPoll(driver),
+      () => runPoll(user),
       POLL_INTERVAL_MS
     );
 
     return () => stopPolling();
-  }, [screen, registeredDriver, runPoll]);
+  }, [screen, registeredUser, runPoll]);
 
   // ── Start tracking poll when screen = 'tracking' ──────────────────────────────
   // Detects when admin ends the shift from the dashboard
   useEffect(() => {
     if (screen !== 'tracking' || !activeSession) return;
 
-    const driver = activeSession.driver;
+    const user = activeSession.user;
     const interval = setInterval(
-      () => runPoll(driver, true),
+      () => runPoll(user, true),
       POLL_INTERVAL_MS
     );
 
@@ -205,78 +245,66 @@ export default function App() {
   }, [screen, activeSession, runPoll]);
 
   // ── Stop tracking & return to waiting ─────────────────────────────────────────
-  async function doStopTracking(driver: Driver) {
+  async function doStopTracking(user: User) {
     await LocationService.stopTracking();
     await LocationService.clearQueue(); // ← discard stale offline pings from ended shift
     await AsyncStorage.removeItem(SESSION_KEY);
     setActiveSession(null);
     setLastLocation(null);
-    setRegisteredDriver(driver);
+    setRegisteredUser(user);
     setScreen('waiting');
   }
 
-  // ── Manual end shift (End Shift button on phone) ──────────────────────────────
-  // Note: in the new flow the admin ends shifts, but keep this as a fallback
-  function confirmEndShift() {
-    Alert.alert('End Shift', 'Are you sure you want to end your shift?', [
-      { text: 'Cancel', style: 'cancel' },
-      {
-        text: 'End Shift', style: 'destructive',
-        onPress: async () => {
-          if (!activeSession) return;
-          try {
-            await fetch(`${API}/api/vehicles/${activeSession.vehicle._id}/endShift`, {
-              method: 'PUT',
-              headers: {
-                'Content-Type': 'application/json',
-                'ngrok-skip-browser-warning': 'true',
-              },
-              body: JSON.stringify({ endShift: true, driverId: activeSession.driver._id }),
-            }).catch(() => {});
-            await doStopTracking(activeSession.driver);
-          } catch (err) {
-            Alert.alert('Error', 'Failed to end shift. Please try again.');
-          }
-        },
-      },
-    ]);
-  }
-
-  // ── Registration ──────────────────────────────────────────────────────────────
+  // ── Handle user registration ───────────────────────────────────────────────────
   async function handleRegister() {
-    if (!regName.trim()) {
-      Alert.alert('Name required', 'Please enter your full name.');
+    if (!regName.trim() || !regEmpId.trim()) {
+      Alert.alert(
+        'Name required',
+        'Please enter your full name and your employee Id.'
+      );
       return;
     }
-    setRegistering(true);
+
     try {
-      const deviceId = Device.osBuildId ?? Device.modelId ?? `device_${Date.now()}`;
+      setRegistering(true);
 
-      const res = await fetch(`${API}/api/drivers/register`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'ngrok-skip-browser-warning': 'true',
-        },
-        body: JSON.stringify({
-          name:       regName.trim(),
-          phone:      regPhone.trim() || undefined,
-          employeeId: regEmpId.trim() || undefined,
+      const deviceId = getDeviceId();
+
+      const res = await axios.post(
+        `${API}/api/users/register`,
+        {
+          name: regName.trim(),
+          employeeId: regEmpId.trim(),
           deviceId,
-        }),
-      });
+        },
+        {
+          headers: {
+            'Content-Type': 'application/json',
+            'ngrok-skip-browser-warning': 'true',
+          },
+        }
+      );
 
-      if (!res.ok) {
-        const body = await res.json().catch(() => ({}));
-        throw new Error(body.error || 'Registration failed');
+      const { success, message, data } = res.data;
+
+      if (success) {
+        await AsyncStorage.setItem(
+          REGISTRATION_KEY,
+          JSON.stringify(data)
+        );
+        setRegisteredUser(data);
+        setScreen('waiting');
+        Alert.alert('✅ Registration Succeeded', message);
+      } else {
+        Alert.alert('Failed', message);
       }
-
-      const driver: Driver = await res.json();
-      await AsyncStorage.setItem(REGISTRATION_KEY, JSON.stringify(driver));
-      setRegisteredDriver(driver);
-      setScreen('waiting');
     } catch (err: any) {
-      Alert.alert('Registration failed', err.message);
+      const message =
+        err?.response?.data?.message ??
+        err?.response?.data?.error ??
+        'Registration failed';
+      Alert.alert('❌ Registration Failed', message);
+      console.log(err.response?.data || err);
     } finally {
       setRegistering(false);
     }
@@ -294,9 +322,8 @@ export default function App() {
           onPress: async () => {
             stopPolling();
             await AsyncStorage.removeItem(REGISTRATION_KEY);
-            setRegisteredDriver(null);
+            setRegisteredUser(null);
             setRegName('');
-            setRegPhone('');
             setRegEmpId('');
             setScreen('register');
           },
@@ -337,21 +364,10 @@ export default function App() {
             returnKeyType="next"
           />
 
-          <Text style={[s.fieldLabel, { marginTop: 16 }]}>PHONE NUMBER</Text>
+          <Text style={[s.fieldLabel, { marginTop: 16 }]}>EMPLOYEE / BADGE ID *</Text>
           <TextInput
             style={s.input}
-            placeholder="e.g. 0712 345 678"
-            placeholderTextColor={C.dim}
-            value={regPhone}
-            onChangeText={setRegPhone}
-            keyboardType="phone-pad"
-            returnKeyType="next"
-          />
-
-          <Text style={[s.fieldLabel, { marginTop: 16 }]}>EMPLOYEE / BADGE ID</Text>
-          <TextInput
-            style={s.input}
-            placeholder="e.g. EMP-001 (optional)"
+            placeholder="e.g. EMP-001"
             placeholderTextColor={C.dim}
             value={regEmpId}
             onChangeText={setRegEmpId}
@@ -366,9 +382,9 @@ export default function App() {
         </Text>
 
         <TouchableOpacity
-          style={[s.primaryBtn, (!regName.trim() || registering) && s.primaryBtnDisabled]}
+          style={[s.primaryBtn, (!regName.trim() || !regEmpId.trim() || registering) && s.primaryBtnDisabled]}
           onPress={handleRegister}
-          disabled={!regName.trim() || registering}
+          disabled={!regName.trim() || !regEmpId.trim() || registering}
         >
           {registering
             ? <ActivityIndicator color="#fff" />
@@ -389,12 +405,9 @@ export default function App() {
 
         <View style={s.waitingCard}>
           <Text style={s.waitingIcon}>👋</Text>
-          <Text style={s.waitingName}>Hi, {registeredDriver?.name}</Text>
-          {registeredDriver?.employeeId && (
-            <Text style={s.waitingMeta}>ID: {registeredDriver.employeeId}</Text>
-          )}
-          {registeredDriver?.phone && (
-            <Text style={s.waitingMeta}>{registeredDriver.phone}</Text>
+          <Text style={s.waitingName}>Hi, {registeredUser?.name}</Text>
+          {registeredUser?.employeeId && (
+            <Text style={s.waitingMeta}>ID: {registeredUser.employeeId}</Text>
           )}
 
           <View style={s.waitingDivider} />
@@ -402,13 +415,14 @@ export default function App() {
           <View style={s.waitingStatusRow}>
             <View style={[s.waitingDot, pollError && s.waitingDotError]} />
             <Text style={[s.waitingStatus, pollError && s.waitingStatusError]}>
-              {pollError ? 'Cannot reach server' : 'Waiting for shift assignment'}
+              {pollError ? 'Cannot reach server' : 'Waiting for check-in'}
             </Text>
           </View>
 
           <Text style={s.waitingSub}>
-            Your manager will assign you a vehicle and start your shift
-            from the dashboard. This app will begin tracking automatically.
+            Your shift will start once you check in at the Skylink Operations Website.
+            The app will automatically track you during your shift and stop when the shift ends.
+            The shift ends once you checkout in the Skylink Operations Website.
           </Text>
 
           <Text style={s.waitingPollNote}>
@@ -434,7 +448,6 @@ export default function App() {
       <TrackingScreen
         session={activeSession}
         lastLocation={lastLocation}
-        onEndShift={confirmEndShift}
       />
     );
   }
@@ -443,10 +456,9 @@ export default function App() {
 }
 
 // ─── Tracking Screen Component ────────────────────────────────────────────────
-function TrackingScreen({ session, lastLocation, onEndShift }: {
+function TrackingScreen({ session, lastLocation }: {
   session: ActiveSession;
   lastLocation: Location.LocationObject | null;
-  onEndShift: () => void;
 }) {
   const [, setTick] = useState(0);
   useEffect(() => {
@@ -454,10 +466,10 @@ function TrackingScreen({ session, lastLocation, onEndShift }: {
     return () => clearInterval(t);
   }, []);
 
-  const coords   = lastLocation?.coords;
+  const coords = lastLocation?.coords;
   const speedKmh = coords?.speed != null && coords.speed >= 0
     ? (coords.speed * 3.6).toFixed(1) : '0.0';
-  const mins     = Math.floor((Date.now() - new Date(session.startedAt).getTime()) / 60_000);
+  const mins = Math.floor((Date.now() - new Date(session.startedAt).getTime()) / 60_000);
   const duration = mins < 60 ? `${mins} min` : `${Math.floor(mins / 60)}h ${mins % 60}m`;
 
   return (
@@ -471,22 +483,19 @@ function TrackingScreen({ session, lastLocation, onEndShift }: {
       </View>
 
       <View style={s.card}>
-        <Text style={s.cardDriver}>{session.driver.name}</Text>
-        {session.driver.employeeId && (
-          <Text style={s.cardEmployeeId}>ID: {session.driver.employeeId}</Text>
+        <Text style={s.cardDriver}>{session.user.name}</Text>
+        {session.user.employeeId && (
+          <Text style={s.cardEmployeeId}>ID: {session.user.employeeId}</Text>
         )}
         <View style={s.divider} />
-        <Text style={s.cardVehicle}>{session.vehicle.name}</Text>
-        {session.vehicle.plateNumber && (
-          <Text style={s.cardPlate}>{session.vehicle.plateNumber}</Text>
-        )}
+        <Text style={s.cardVehicle}>Technician Account: {session.technician.name}</Text>
         <Text style={s.cardDuration}>Duration: {duration}</Text>
       </View>
 
       <View style={s.statsRow}>
         {[
           { value: speedKmh, unit: 'km/h' },
-          { value: coords?.heading  != null ? `${coords.heading.toFixed(0)}°`   : '–', unit: 'heading'  },
+          { value: coords?.heading != null ? `${coords.heading.toFixed(0)}°` : '–', unit: 'heading' },
           { value: coords?.accuracy != null ? `±${coords.accuracy.toFixed(0)}m` : '–', unit: 'accuracy' },
         ].map((stat, i) => (
           <View key={i} style={s.statCell}>
